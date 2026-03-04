@@ -1,0 +1,66 @@
+# Unity
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]serSettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+*.pidb
+*.unityproj
+*.sln
+*.csproj
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb.meta
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+*.apk
+*.aab
+
+# Crashlytics
+crashlytics-build.properties
+sysinfo.txt
+
+# Asset exclusions
+Assets/TerrainDemoScene_HDRP/
+Assets/TerrainDemoScene_HDRP.meta
+Assets/Third Party/
+Assets/Third Party.meta
+Assets/TextMesh Pro/
+Assets/TextMesh Pro.meta
+Assets/Fantasy Forest Environment Free Sample/
+Assets/Fantasy Forest Environment Free Sample.meta
+Assets/Skybox/Cubemaps/
+Assets/Skybox/Cubemaps.meta
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+*.egg
+
+# ControlPy runtime artifacts
+ControlPy/recent_frames/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.claude/
+.idea/
+.vs/
+.vscode/
+.cursor/
+*.swp
