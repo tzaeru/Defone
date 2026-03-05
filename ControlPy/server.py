@@ -33,8 +33,33 @@ _last_save_time = 0.0
 _saved_filenames: collections.deque = collections.deque()  # tracks filenames for ring-buffer cleanup
 
 
-def _maybe_save_frame(image_payload: bytes, boxes_json: str):
-    """Save image + boxes if at least 1s has elapsed since last save. Keep last 10."""
+def _init_saved_filenames():
+    """Scan recent_frames/ on startup to populate the deque, so restarts don't lose track."""
+    if not os.path.isdir(_SAVE_DIR):
+        return
+    # Find all .jpg files, extract timestamp stems, sort oldest-first
+    timestamps = set()
+    for name in os.listdir(_SAVE_DIR):
+        if name.endswith(".jpg"):
+            timestamps.add(name[:-4])  # strip .jpg
+    for ts in sorted(timestamps):
+        _saved_filenames.append(ts)
+    # Evict if over limit
+    while len(_saved_filenames) > _MAX_SAVED:
+        old = _saved_filenames.popleft()
+        for ext in (".jpg", ".json", "_depth.jpg"):
+            path = os.path.join(_SAVE_DIR, f"{old}{ext}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+_init_saved_filenames()
+
+
+def _maybe_save_frame(image_payload: bytes, boxes_json: str, depth_payload: bytes | None = None):
+    """Save image + boxes (+ optional depth) if at least 1s has elapsed since last save. Keep last 10."""
     global _last_save_time
     now = time.time()
     with _save_lock:
@@ -52,12 +77,17 @@ def _maybe_save_frame(image_payload: bytes, boxes_json: str):
         with open(box_path, "w") as f:
             f.write(boxes_json)
 
+        if depth_payload is not None:
+            depth_path = os.path.join(_SAVE_DIR, f"{timestamp}_depth.jpg")
+            with open(depth_path, "wb") as f:
+                f.write(depth_payload)
+
         _saved_filenames.append(timestamp)
 
         # Evict oldest beyond limit
         while len(_saved_filenames) > _MAX_SAVED:
             old = _saved_filenames.popleft()
-            for ext in (".jpg", ".json"):
+            for ext in (".jpg", ".json", "_depth.jpg"):
                 path = os.path.join(_SAVE_DIR, f"{old}{ext}")
                 try:
                     os.remove(path)
@@ -98,6 +128,40 @@ def _handle_detect(image_payload: bytes) -> bytes:
     return boxes_json.encode("utf-8")
 
 
+def _handle_detect_depth(payload: bytes) -> bytes:
+    """Split combined color+depth payload, run detection on color, save both."""
+    import struct
+    if len(payload) < 4:
+        return json.dumps({"error": "Payload too short", "boxes": []}).encode("utf-8")
+    color_len = struct.unpack(">I", payload[:4])[0]
+    if len(payload) < 4 + color_len:
+        return json.dumps({"error": "Incomplete color data", "boxes": []}).encode("utf-8")
+    color_data = payload[4:4 + color_len]
+    depth_data = payload[4 + color_len:]
+
+    arr = np.frombuffer(color_data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return json.dumps({"error": "Invalid color image", "boxes": []}).encode("utf-8")
+    model = _get_drone_detector()
+    from drone_detection import detect_drones
+    detections = detect_drones(img, model=model, verbose=False)
+    boxes = [
+        {
+            "x1": d.xyxy[0],
+            "y1": d.xyxy[1],
+            "x2": d.xyxy[2],
+            "y2": d.xyxy[3],
+            "confidence": d.confidence,
+            "className": d.class_name,
+        }
+        for d in detections
+    ]
+    boxes_json = json.dumps({"boxes": boxes})
+    _maybe_save_frame(color_data, boxes_json, depth_payload=depth_data if len(depth_data) > 0 else None)
+    return boxes_json.encode("utf-8")
+
+
 class MessageHandler(socketserver.BaseRequestHandler):
     def handle(self):
         try:
@@ -109,6 +173,14 @@ class MessageHandler(socketserver.BaseRequestHandler):
                 elif msg_type == "detect":
                     try:
                         reply_payload = _handle_detect(payload)
+                        reply = encode_message("boxes", reply_payload)
+                        self.request.sendall(reply)
+                    except Exception as e:
+                        err = json.dumps({"error": str(e), "boxes": []}).encode("utf-8")
+                        self.request.sendall(encode_message("boxes", err))
+                elif msg_type == "detect_depth":
+                    try:
+                        reply_payload = _handle_detect_depth(payload)
                         reply = encode_message("boxes", reply_payload)
                         self.request.sendall(reply)
                     except Exception as e:
