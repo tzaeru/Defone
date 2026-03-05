@@ -4,16 +4,21 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 /// <summary>
 /// Sends mainCameraView to the ControlPy TCP server for drone detection,
 /// receives bounding boxes, and writes mainCameraView + drawn boxes to augmentedCameraView.
+/// Uses AsyncGPUReadback to avoid stalling the render pipeline.
+/// Keeps a persistent TCP connection to avoid per-frame connect overhead.
 /// </summary>
 public class PythonCommunicator : MonoBehaviour
 {
     [Header("Textures")]
     public RenderTexture mainCameraView;
     public RenderTexture augmentedCameraView;
+    [Tooltip("Depth visualization RT from DepthCapture. If set, depth is sent alongside color.")]
+    public RenderTexture depthView;
 
     [Header("Connection")]
     public string host = "127.0.0.1";
@@ -22,7 +27,7 @@ public class PythonCommunicator : MonoBehaviour
     [Header("Detection")]
     [Tooltip("Seconds between sending a frame for detection.")]
     public float detectionInterval = 0.2f;
-    [Tooltip("Minimum confidence for drawn boxes (0–1). Higher reduces false positives (e.g. branches).")]
+    [Tooltip("Minimum confidence for drawn boxes (0-1).")]
     [Range(0f, 1f)]
     public float minConfidence = 0.4f;
     [Tooltip("Color of bounding box lines.")]
@@ -34,15 +39,31 @@ public class PythonCommunicator : MonoBehaviour
 
     // Shared state between main thread and worker
     private readonly object _lock = new object();
-    private byte[] _pendingImage;
     private List<BoundingBox> _receivedBoxes = new List<BoundingBox>();
     private bool _requestInFlight;
     private bool _pendingBoxLog;
     private float _lastBoxLogTime = -999f;
     private float _lastRequestTime;
-    private Texture2D _readbackTexture;
     private Material _lineMaterial;
     private bool _lineMaterialFailed;
+
+    // Pre-allocated textures for encoding (avoids GC alloc per frame)
+    private Texture2D _colorEncodeTexture;
+    private Texture2D _depthEncodeTexture;
+
+    // Async readback coordination
+    private byte[] _asyncColorJpg;
+    private byte[] _asyncDepthJpg;
+    private bool _asyncColorDone;
+    private bool _asyncDepthDone;
+    private bool _asyncReadbackActive;
+
+    // Persistent TCP connection
+    private TcpClient _tcpClient;
+    private NetworkStream _tcpStream;
+    private readonly object _tcpLock = new object();
+    private long _lastConnectAttemptMs;
+    private const long RECONNECT_INTERVAL_MS = 2000;
 
     [Serializable]
     public class BoundingBoxDto
@@ -67,6 +88,10 @@ public class PythonCommunicator : MonoBehaviour
 
     void Start()
     {
+        // Force Performant quality level at runtime (index 2) for usable frame rates
+        if (QualitySettings.GetQualityLevel() != 2)
+            QualitySettings.SetQualityLevel(2, true);
+
         if (mainCameraView != null && augmentedCameraView != null &&
             (mainCameraView.width != augmentedCameraView.width || mainCameraView.height != augmentedCameraView.height))
             Debug.LogWarning("[PythonCommunicator] mainCameraView and augmentedCameraView have different sizes; boxes may not align.");
@@ -74,18 +99,19 @@ public class PythonCommunicator : MonoBehaviour
 
     void OnDestroy()
     {
-        if (_lineMaterial != null)
-            Destroy(_lineMaterial);
+        if (_lineMaterial != null) Destroy(_lineMaterial);
+        if (_colorEncodeTexture != null) Destroy(_colorEncodeTexture);
+        if (_depthEncodeTexture != null) Destroy(_depthEncodeTexture);
+        CloseConnection();
     }
 
     void Update()
     {
         if (mainCameraView == null || augmentedCameraView == null) return;
 
-        // 1) Always write mainCameraView + last known boxes to augmentedCameraView
         BlitMainAndDrawBoxes();
 
-        // 2) Print received boxes at most once every boxLogInterval seconds
+        // Print received boxes at most once every boxLogInterval seconds
         if (boxLogInterval > 0)
         {
             lock (_lock)
@@ -114,74 +140,138 @@ public class PythonCommunicator : MonoBehaviour
             }
         }
 
-        // 3) Periodically send a frame for detection (one request at a time)
+        // Periodically kick off async readback for detection
         if (detectionInterval > 0 && Time.time - _lastRequestTime >= detectionInterval)
         {
-            lock (_lock)
+            bool canStart;
+            lock (_lock) { canStart = !_requestInFlight && !_asyncReadbackActive; }
+            if (canStart)
             {
-                if (!_requestInFlight && _pendingImage == null)
-                {
-                    byte[] jpg = EncodeMainCameraToJpg();
-                    if (jpg != null && jpg.Length > 0)
-                    {
-                        _requestInFlight = true;
-                        _lastRequestTime = Time.time;
-                        byte[] copy = jpg;
-                        Thread t = new Thread(() => SendImageAndReceiveBoxes(copy));
-                        t.IsBackground = true;
-                        t.Start();
-                    }
-                }
+                _lastRequestTime = Time.time;
+                StartAsyncReadback();
             }
         }
     }
 
-    private byte[] EncodeMainCameraToJpg()
+    private void StartAsyncReadback()
     {
-        if (mainCameraView == null) return null;
-        int w = mainCameraView.width;
-        int h = mainCameraView.height;
-        if (w <= 0 || h <= 0) return null;
+        _asyncReadbackActive = true;
+        _asyncColorDone = false;
+        _asyncDepthDone = depthView == null;
+        _asyncColorJpg = null;
+        _asyncDepthJpg = null;
 
-        if (_readbackTexture == null || _readbackTexture.width != w || _readbackTexture.height != h)
-        {
-            if (_readbackTexture != null) Destroy(_readbackTexture);
-            _readbackTexture = new Texture2D(w, h, TextureFormat.RGB24, false);
-        }
+        AsyncGPUReadback.Request(mainCameraView, 0, TextureFormat.RGB24, OnColorReadbackComplete);
 
-        RenderTexture prev = RenderTexture.active;
-        RenderTexture.active = mainCameraView;
-        _readbackTexture.ReadPixels(new Rect(0, 0, w, h), 0, 0);
-        _readbackTexture.Apply();
-        RenderTexture.active = prev;
-
-        byte[] jpg = _readbackTexture.EncodeToJPG(85);
-        return jpg;
+        if (depthView != null)
+            AsyncGPUReadback.Request(depthView, 0, TextureFormat.RGB24, OnDepthReadbackComplete);
     }
 
-    private void SendImageAndReceiveBoxes(byte[] jpgBytes)
+    private void OnColorReadbackComplete(AsyncGPUReadbackRequest req)
+    {
+        if (req.hasError)
+        {
+            _asyncColorDone = true;
+            _asyncReadbackActive = false;
+            return;
+        }
+
+        EnsureEncodeTexture(ref _colorEncodeTexture, req.width, req.height);
+        _colorEncodeTexture.LoadRawTextureData(req.GetData<byte>());
+        _colorEncodeTexture.Apply(false, false);
+        _asyncColorJpg = _colorEncodeTexture.EncodeToJPG(85);
+        _asyncColorDone = true;
+
+        TryDispatchToNetwork();
+    }
+
+    private void OnDepthReadbackComplete(AsyncGPUReadbackRequest req)
+    {
+        if (req.hasError)
+        {
+            _asyncDepthDone = true;
+            TryDispatchToNetwork();
+            return;
+        }
+
+        EnsureEncodeTexture(ref _depthEncodeTexture, req.width, req.height);
+        _depthEncodeTexture.LoadRawTextureData(req.GetData<byte>());
+        _depthEncodeTexture.Apply(false, false);
+        _asyncDepthJpg = _depthEncodeTexture.EncodeToJPG(85);
+        _asyncDepthDone = true;
+
+        TryDispatchToNetwork();
+    }
+
+    private void EnsureEncodeTexture(ref Texture2D tex, int w, int h)
+    {
+        if (tex == null || tex.width != w || tex.height != h)
+        {
+            if (tex != null) Destroy(tex);
+            tex = new Texture2D(w, h, TextureFormat.RGB24, false);
+        }
+    }
+
+    private void TryDispatchToNetwork()
+    {
+        if (!_asyncColorDone || !_asyncDepthDone) return;
+        _asyncReadbackActive = false;
+
+        byte[] colorJpg = _asyncColorJpg;
+        byte[] depthJpg = _asyncDepthJpg;
+        _asyncColorJpg = null;
+        _asyncDepthJpg = null;
+
+        if (colorJpg == null || colorJpg.Length == 0) return;
+
+        lock (_lock) { _requestInFlight = true; }
+
+        Thread t = new Thread(() => SendAndReceive(colorJpg, depthJpg));
+        t.IsBackground = true;
+        t.Start();
+    }
+
+    private void SendAndReceive(byte[] jpgBytes, byte[] depthJpgBytes)
     {
         try
         {
-            using (var client = new TcpClient())
+            NetworkStream stream = GetOrCreateConnection();
+            if (stream == null) return;
+
+            try
             {
-                client.Connect(host, port);
-                client.ReceiveTimeout = 30000;
-                client.SendTimeout = 10000;
-                using (NetworkStream stream = client.GetStream())
+                if (depthJpgBytes != null && depthJpgBytes.Length > 0)
+                {
+                    int colorLen = jpgBytes.Length;
+                    byte[] combined = new byte[4 + colorLen + depthJpgBytes.Length];
+                    combined[0] = (byte)(colorLen >> 24);
+                    combined[1] = (byte)(colorLen >> 16);
+                    combined[2] = (byte)(colorLen >> 8);
+                    combined[3] = (byte)colorLen;
+                    Buffer.BlockCopy(jpgBytes, 0, combined, 4, colorLen);
+                    Buffer.BlockCopy(depthJpgBytes, 0, combined, 4 + colorLen, depthJpgBytes.Length);
+                    ControlPyClient.SendMessage(stream, "detect_depth", combined);
+                }
+                else
                 {
                     ControlPyClient.SendMessage(stream, "detect", jpgBytes);
-                    string replyType, payload;
-                    if (ControlPyClient.TryReadMessage(stream, out replyType, out payload) && replyType == "boxes")
+                }
+
+                string replyType, payload;
+                if (ControlPyClient.TryReadMessage(stream, out replyType, out payload) && replyType == "boxes")
+                {
+                    List<BoundingBox> boxes = ParseBoxes(payload);
+                    lock (_lock)
                     {
-                        List<BoundingBox> boxes = ParseBoxes(payload);
-                        lock (_lock)
-                        {
-                            _receivedBoxes = boxes;
-                            _pendingBoxLog = true;
-                        }
+                        _receivedBoxes = boxes;
+                        _pendingBoxLog = true;
                     }
                 }
+            }
+            catch (Exception)
+            {
+                CloseConnection();
+                throw;
             }
         }
         catch (Exception ex)
@@ -192,6 +282,50 @@ public class PythonCommunicator : MonoBehaviour
         {
             lock (_lock) { _requestInFlight = false; }
         }
+    }
+
+    private NetworkStream GetOrCreateConnection()
+    {
+        lock (_tcpLock)
+        {
+            if (_tcpClient != null && _tcpClient.Connected && _tcpStream != null)
+                return _tcpStream;
+
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (nowMs - _lastConnectAttemptMs < RECONNECT_INTERVAL_MS)
+                return null;
+            _lastConnectAttemptMs = nowMs;
+
+            CloseConnectionLocked();
+            try
+            {
+                _tcpClient = new TcpClient();
+                _tcpClient.Connect(host, port);
+                _tcpClient.ReceiveTimeout = 30000;
+                _tcpClient.SendTimeout = 10000;
+                _tcpClient.NoDelay = true;
+                _tcpStream = _tcpClient.GetStream();
+                return _tcpStream;
+            }
+            catch (Exception)
+            {
+                CloseConnectionLocked();
+                return null;
+            }
+        }
+    }
+
+    private void CloseConnection()
+    {
+        lock (_tcpLock) { CloseConnectionLocked(); }
+    }
+
+    private void CloseConnectionLocked()
+    {
+        try { _tcpStream?.Close(); } catch { }
+        try { _tcpClient?.Close(); } catch { }
+        _tcpStream = null;
+        _tcpClient = null;
     }
 
     private static List<BoundingBox> ParseBoxes(string json)
@@ -236,7 +370,6 @@ public class PythonCommunicator : MonoBehaviour
         int dstH = augmentedCameraView.height;
         int srcW = mainCameraView.width;
         int srcH = mainCameraView.height;
-        // Scale from detection image space (mainCameraView when we sent the frame) to display RT
         float scaleX = (float)dstW / Mathf.Max(1, srcW);
         float scaleY = (float)dstH / Mathf.Max(1, srcH);
 
@@ -244,7 +377,6 @@ public class PythonCommunicator : MonoBehaviour
         RenderTexture.active = augmentedCameraView;
 
         GL.PushMatrix();
-        // LoadPixelMatrix(left, right, bottom, top): (0,0) top-left, y down; so bottom=dstH, top=0
         GL.LoadPixelMatrix(0, dstW, dstH, 0);
         _lineMaterial.SetPass(0);
         _lineMaterial.color = boxColor;
@@ -254,12 +386,10 @@ public class PythonCommunicator : MonoBehaviour
         foreach (var b in boxes)
         {
             if (b.confidence < minConfidence) continue;
-            // Normalize to min/max (Python may return either order) and scale to display size
             float xMin = Mathf.Min(b.x1, b.x2) * scaleX;
             float xMax = Mathf.Max(b.x1, b.x2) * scaleX;
             float yMin = Mathf.Min(b.y1, b.y2) * scaleY;
             float yMax = Mathf.Max(b.y1, b.y2) * scaleY;
-            // Clamp to view (with margin so border stays visible)
             xMin = Mathf.Clamp(xMin, -half, dstW + half);
             xMax = Mathf.Clamp(xMax, -half, dstW + half);
             yMin = Mathf.Clamp(yMin, -half, dstH + half);
@@ -274,24 +404,21 @@ public class PythonCommunicator : MonoBehaviour
 
     private static void DrawRectQuads(float xMin, float yMin, float xMax, float yMax, float half)
     {
-        // In LoadPixelMatrix(0,w,h,0): y=0 is top, y=h is bottom. So "top" of box = smaller y = yMin, "bottom" = yMax.
-        // Draw four edge quads (each as a thin rectangle).
-        // Top edge (at yMin)
         GL.Vertex3(xMin - half, yMin - half, 0);
         GL.Vertex3(xMax + half, yMin - half, 0);
         GL.Vertex3(xMax + half, yMin + half, 0);
         GL.Vertex3(xMin - half, yMin + half, 0);
-        // Bottom edge (at yMax)
+
         GL.Vertex3(xMin - half, yMax - half, 0);
         GL.Vertex3(xMax + half, yMax - half, 0);
         GL.Vertex3(xMax + half, yMax + half, 0);
         GL.Vertex3(xMin - half, yMax + half, 0);
-        // Left edge (at xMin)
+
         GL.Vertex3(xMin - half, yMin - half, 0);
         GL.Vertex3(xMin + half, yMin - half, 0);
         GL.Vertex3(xMin + half, yMax + half, 0);
         GL.Vertex3(xMin - half, yMax + half, 0);
-        // Right edge (at xMax)
+
         GL.Vertex3(xMax - half, yMin - half, 0);
         GL.Vertex3(xMax + half, yMin - half, 0);
         GL.Vertex3(xMax + half, yMax + half, 0);
