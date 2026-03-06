@@ -37,6 +37,12 @@ public class PythonCommunicator : MonoBehaviour
     [Tooltip("Minimum seconds between printing received bounding boxes to the console.")]
     public float boxLogInterval = 2f;
 
+    [Header("Ground Truth")]
+    [Tooltip("Camera used for world-to-screen projection. If null, uses Camera.main.")]
+    public Camera projectionCamera;
+    [Tooltip("Names of drone GameObjects to track for ground truth positions.")]
+    public string[] droneNames = new string[] { "drone 1", "drone 2" };
+
     // Shared state between main thread and worker
     private readonly object _lock = new object();
     private List<BoundingBox> _receivedBoxes = new List<BoundingBox>();
@@ -54,6 +60,7 @@ public class PythonCommunicator : MonoBehaviour
     // Async readback coordination
     private byte[] _asyncColorJpg;
     private byte[] _asyncDepthJpg;
+    private byte[] _asyncRealPositions; // JSON for real_positions message
     private bool _asyncColorDone;
     private bool _asyncDepthDone;
     private bool _asyncReadbackActive;
@@ -64,6 +71,11 @@ public class PythonCommunicator : MonoBehaviour
     private readonly object _tcpLock = new object();
     private long _lastConnectAttemptMs;
     private const long RECONNECT_INTERVAL_MS = 2000;
+
+    // Cached drone transforms for visual center
+    private Transform[] _droneTransforms;
+    private bool _dronesResolved;
+    private bool _groundTruthLoggedOnce;
 
     [Serializable]
     public class BoundingBoxDto
@@ -153,6 +165,99 @@ public class PythonCommunicator : MonoBehaviour
         }
     }
 
+    // ── Ground truth ──────────────────────────────────────────────────
+
+    private void ResolveDrones()
+    {
+        if (_dronesResolved) return;
+        _dronesResolved = true;
+        _droneTransforms = new Transform[droneNames.Length];
+        for (int i = 0; i < droneNames.Length; i++)
+        {
+            var go = GameObject.Find(droneNames[i]);
+            if (go != null)
+                _droneTransforms[i] = go.transform;
+            else
+                Debug.LogWarning($"[PythonCommunicator] Drone '{droneNames[i]}' not found in scene.");
+        }
+    }
+
+    /// <summary>
+    /// Compute the combined world-space bounds center of all Renderers on a GameObject.
+    /// Falls back to transform.position if no renderers found.
+    /// </summary>
+    private static Vector3 GetVisualCenter(Transform droneRoot)
+    {
+        var renderers = droneRoot.GetComponentsInChildren<Renderer>();
+        if (renderers.Length == 0) return droneRoot.position;
+        Bounds combined = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++)
+            combined.Encapsulate(renderers[i].bounds);
+        return combined.center;
+    }
+
+    /// <summary>
+    /// Build a simple JSON array of real drone screen positions:
+    /// [{"name":"drone 1","x":512.3,"y":204.1}, ...]
+    /// Returns UTF-8 bytes or null if no camera available.
+    /// </summary>
+    private byte[] BuildRealPositionsJson()
+    {
+        ResolveDrones();
+        Camera cam = projectionCamera;
+        if (cam == null) cam = Camera.main;
+        if (cam == null)
+        {
+            if (!_groundTruthLoggedOnce)
+            {
+                _groundTruthLoggedOnce = true;
+                Debug.LogWarning("[PythonCommunicator] No projection camera found. Real positions will not be sent.");
+            }
+            return null;
+        }
+        if (_droneTransforms == null || _droneTransforms.Length == 0) return null;
+
+        int imgW = mainCameraView.width;
+        int imgH = mainCameraView.height;
+
+        // Build JSON manually to keep it simple and avoid Unity's JsonUtility array quirks
+        var sb = new StringBuilder();
+        sb.Append('[');
+        bool first = true;
+        for (int i = 0; i < _droneTransforms.Length; i++)
+        {
+            if (_droneTransforms[i] == null) continue;
+            // Use combined renderer bounds center (visual center) instead of transform.position
+            // because the drone pivot may be underneath the model
+            Vector3 world = GetVisualCenter(_droneTransforms[i]);
+            Vector3 vp = cam.WorldToViewportPoint(world);
+            bool visible = vp.z > 0 && vp.x >= 0 && vp.x <= 1 && vp.y >= 0 && vp.y <= 1;
+            if (!visible) continue;
+
+            float sx = vp.x * imgW;
+            float sy = (1f - vp.y) * imgH; // flip Y: viewport bottom=0, image top=0
+
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append("{\"name\":\"").Append(droneNames[i]).Append("\",\"x\":");
+            sb.Append(sx.ToString("F1", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append(",\"y\":");
+            sb.Append(sy.ToString("F1", System.Globalization.CultureInfo.InvariantCulture));
+            sb.Append('}');
+        }
+        sb.Append(']');
+
+        string json = sb.ToString();
+        if (!_groundTruthLoggedOnce)
+        {
+            _groundTruthLoggedOnce = true;
+            Debug.Log($"[PythonCommunicator] Real positions: {json}");
+        }
+        return Encoding.UTF8.GetBytes(json);
+    }
+
+    // ── Async readback + network ──────────────────────────────────────
+
     private void StartAsyncReadback()
     {
         _asyncReadbackActive = true;
@@ -160,6 +265,7 @@ public class PythonCommunicator : MonoBehaviour
         _asyncDepthDone = depthView == null;
         _asyncColorJpg = null;
         _asyncDepthJpg = null;
+        _asyncRealPositions = BuildRealPositionsJson();
 
         AsyncGPUReadback.Request(mainCameraView, 0, TextureFormat.RGB24, OnColorReadbackComplete);
 
@@ -219,19 +325,21 @@ public class PythonCommunicator : MonoBehaviour
 
         byte[] colorJpg = _asyncColorJpg;
         byte[] depthJpg = _asyncDepthJpg;
+        byte[] realPos = _asyncRealPositions;
         _asyncColorJpg = null;
         _asyncDepthJpg = null;
+        _asyncRealPositions = null;
 
         if (colorJpg == null || colorJpg.Length == 0) return;
 
         lock (_lock) { _requestInFlight = true; }
 
-        Thread t = new Thread(() => SendAndReceive(colorJpg, depthJpg));
+        Thread t = new Thread(() => SendAndReceive(colorJpg, depthJpg, realPos));
         t.IsBackground = true;
         t.Start();
     }
 
-    private void SendAndReceive(byte[] jpgBytes, byte[] depthJpgBytes)
+    private void SendAndReceive(byte[] jpgBytes, byte[] depthJpgBytes, byte[] realPositionsJson)
     {
         try
         {
@@ -240,6 +348,11 @@ public class PythonCommunicator : MonoBehaviour
 
             try
             {
+                // 1) Send real_positions message (if available) — Python stores it for the next frame save
+                if (realPositionsJson != null && realPositionsJson.Length > 0)
+                    ControlPyClient.SendMessage(stream, "real_positions", realPositionsJson);
+
+                // 2) Send detect or detect_depth (original wire formats, unchanged)
                 if (depthJpgBytes != null && depthJpgBytes.Length > 0)
                 {
                     int colorLen = jpgBytes.Length;
@@ -257,7 +370,13 @@ public class PythonCommunicator : MonoBehaviour
                     ControlPyClient.SendMessage(stream, "detect", jpgBytes);
                 }
 
+                // 3) Read response (Python sends "ack" for real_positions, then "boxes" for detect)
+                //    We only care about the "boxes" reply.
                 string replyType, payload;
+                // Drain the ack from real_positions if we sent one
+                if (realPositionsJson != null && realPositionsJson.Length > 0)
+                    ControlPyClient.TryReadMessage(stream, out replyType, out payload); // ack, discard
+
                 if (ControlPyClient.TryReadMessage(stream, out replyType, out payload) && replyType == "boxes")
                 {
                     List<BoundingBox> boxes = ParseBoxes(payload);
@@ -283,6 +402,8 @@ public class PythonCommunicator : MonoBehaviour
             lock (_lock) { _requestInFlight = false; }
         }
     }
+
+    // ── TCP connection management ─────────────────────────────────────
 
     private NetworkStream GetOrCreateConnection()
     {
@@ -327,6 +448,8 @@ public class PythonCommunicator : MonoBehaviour
         _tcpStream = null;
         _tcpClient = null;
     }
+
+    // ── Parsing + rendering ───────────────────────────────────────────
 
     private static List<BoundingBox> ParseBoxes(string json)
     {

@@ -1,13 +1,16 @@
 """
 TCP server that handles messages with length + type prefix.
-Supports 'echo' and 'detect' message types.
+Supports 'echo', 'detect', 'detect_depth', and 'real_positions' message types.
 'detect': payload = image bytes (JPEG/PNG); response = JSON bounding boxes.
+'real_positions': payload = JSON array of {name, x, y} from Unity; stored and
+                  merged into the next saved frame JSON as "realPositions".
 """
 
 import collections
 import json
 import os
 import socketserver
+import struct
 import threading
 import time
 
@@ -37,10 +40,10 @@ def _init_saved_filenames():
     """Scan recent_frames/ on startup to populate the deque, so restarts don't lose track."""
     if not os.path.isdir(_SAVE_DIR):
         return
-    # Find all .jpg files, extract timestamp stems, sort oldest-first
+    # Find all .jpg files (not _depth), extract timestamp stems, sort oldest-first
     timestamps = set()
     for name in os.listdir(_SAVE_DIR):
-        if name.endswith(".jpg"):
+        if name.endswith(".jpg") and not name.endswith("_depth.jpg"):
             timestamps.add(name[:-4])  # strip .jpg
     for ts in sorted(timestamps):
         _saved_filenames.append(ts)
@@ -103,16 +106,12 @@ def _get_drone_detector():
     return _drone_detector
 
 
-def _handle_detect(image_payload: bytes) -> bytes:
-    """Decode image, run drone detection, return JSON payload for response."""
-    arr = np.frombuffer(image_payload, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return json.dumps({"error": "Invalid image", "boxes": []}).encode("utf-8")
+def _run_detection(img: np.ndarray) -> list[dict]:
+    """Run YOLOv8 detection and return list of box dicts."""
     model = _get_drone_detector()
     from drone_detection import detect_drones
     detections = detect_drones(img, model=model, verbose=False)
-    boxes = [
+    return [
         {
             "x1": d.xyxy[0],
             "y1": d.xyxy[1],
@@ -123,14 +122,28 @@ def _handle_detect(image_payload: bytes) -> bytes:
         }
         for d in detections
     ]
-    boxes_json = json.dumps({"boxes": boxes})
+
+
+def _handle_detect(image_payload: bytes, real_positions: list | None) -> bytes:
+    """Decode image, run drone detection, return JSON payload for response."""
+    arr = np.frombuffer(image_payload, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return json.dumps({"error": "Invalid image", "boxes": []}).encode("utf-8")
+    boxes = _run_detection(img)
+    result = {"boxes": boxes}
+    if real_positions is not None:
+        result["realPositions"] = real_positions
+    boxes_json = json.dumps(result)
     _maybe_save_frame(image_payload, boxes_json)
     return boxes_json.encode("utf-8")
 
 
-def _handle_detect_depth(payload: bytes) -> bytes:
-    """Split combined color+depth payload, run detection on color, save both."""
-    import struct
+def _handle_detect_depth(payload: bytes, real_positions: list | None) -> bytes:
+    """Split combined color+depth payload, run detection on color, save both.
+
+    Wire format: [4B colorLen][colorJPEG][depthJPEG (remainder)]
+    """
     if len(payload) < 4:
         return json.dumps({"error": "Payload too short", "boxes": []}).encode("utf-8")
     color_len = struct.unpack(">I", payload[:4])[0]
@@ -143,49 +156,59 @@ def _handle_detect_depth(payload: bytes) -> bytes:
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         return json.dumps({"error": "Invalid color image", "boxes": []}).encode("utf-8")
-    model = _get_drone_detector()
-    from drone_detection import detect_drones
-    detections = detect_drones(img, model=model, verbose=False)
-    boxes = [
-        {
-            "x1": d.xyxy[0],
-            "y1": d.xyxy[1],
-            "x2": d.xyxy[2],
-            "y2": d.xyxy[3],
-            "confidence": d.confidence,
-            "className": d.class_name,
-        }
-        for d in detections
-    ]
-    boxes_json = json.dumps({"boxes": boxes})
+    boxes = _run_detection(img)
+    result = {"boxes": boxes}
+    if real_positions is not None:
+        result["realPositions"] = real_positions
+    boxes_json = json.dumps(result)
     _maybe_save_frame(color_data, boxes_json, depth_payload=depth_data if len(depth_data) > 0 else None)
     return boxes_json.encode("utf-8")
 
 
 class MessageHandler(socketserver.BaseRequestHandler):
     def handle(self):
+        # Per-connection state: latest real_positions from Unity
+        real_positions: list | None = None
+        rp_logged = False
+
         try:
             while True:
                 msg_type, payload = read_message(self.request)
+
                 if msg_type == "echo":
-                    reply = encode_message("echo", payload)
-                    self.request.sendall(reply)
+                    self.request.sendall(encode_message("echo", payload))
+
+                elif msg_type == "real_positions":
+                    # Store for the next detect/detect_depth on this connection
+                    try:
+                        real_positions = json.loads(payload.decode("utf-8"))
+                        if not rp_logged:
+                            rp_logged = True
+                            print(f"[server] Received real_positions: {len(real_positions)} entries")
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        if not rp_logged:
+                            rp_logged = True
+                            print(f"[server] Failed to parse real_positions: {e}")
+                        real_positions = None
+                    # Send ack so Unity can drain it
+                    self.request.sendall(encode_message("ack", b"ok"))
+
                 elif msg_type == "detect":
                     try:
-                        reply_payload = _handle_detect(payload)
-                        reply = encode_message("boxes", reply_payload)
-                        self.request.sendall(reply)
+                        reply_payload = _handle_detect(payload, real_positions)
+                        self.request.sendall(encode_message("boxes", reply_payload))
                     except Exception as e:
                         err = json.dumps({"error": str(e), "boxes": []}).encode("utf-8")
                         self.request.sendall(encode_message("boxes", err))
+
                 elif msg_type == "detect_depth":
                     try:
-                        reply_payload = _handle_detect_depth(payload)
-                        reply = encode_message("boxes", reply_payload)
-                        self.request.sendall(reply)
+                        reply_payload = _handle_detect_depth(payload, real_positions)
+                        self.request.sendall(encode_message("boxes", reply_payload))
                     except Exception as e:
                         err = json.dumps({"error": str(e), "boxes": []}).encode("utf-8")
                         self.request.sendall(encode_message("boxes", err))
+
                 else:
                     reply = encode_message("error", f"Unknown type: {msg_type}".encode("utf-8"))
                     self.request.sendall(reply)
